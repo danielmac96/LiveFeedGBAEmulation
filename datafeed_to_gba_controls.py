@@ -5,7 +5,7 @@ import time
 import random
 import socket
 
-# --- Configuration ---
+# --- Datafeed ---
 GBA_HOST = "127.0.0.1"
 GBA_PORT = 8888
 # Map your full names to the specific characters your Lua script expects
@@ -147,3 +147,97 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nSystem Offline.")
+
+# --- Store Results ---
+
+import sqlite3
+from datetime import datetime, timedelta
+
+
+def init_db():
+    conn = sqlite3.connect('pokemon_market.db')
+    cursor = conn.cursor()
+
+    # Table 1: Raw logs (every single press)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS raw_moves (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            button TEXT
+        )
+    ''')
+
+    # Table 2: Daily Totals
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS daily_aggregates (
+            date TEXT PRIMARY KEY,
+            button TEXT,
+            press_count INTEGER
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+
+def run_daily_aggregation():
+    """Aggregates yesterday's moves and clears the raw log."""
+    conn = sqlite3.connect('pokemon_market.db')
+    cursor = conn.cursor()
+
+    yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+
+    try:
+        # 1. Get counts for each button
+        cursor.execute('''
+            SELECT button, COUNT(*) 
+            FROM raw_moves 
+            WHERE date(timestamp) = ?
+            GROUP BY button
+        ''', (yesterday,))
+
+        results = cursor.fetchall()
+
+        # 2. Insert into the aggregate table
+        for button, count in results:
+            cursor.execute('''
+                INSERT OR REPLACE INTO daily_aggregates (date, button, press_count)
+                VALUES (?, ?, ?)
+            ''', (yesterday, button, count))
+
+        # 3. Clean up: Delete raw logs older than 24 hours
+        cursor.execute("DELETE FROM raw_moves WHERE timestamp < datetime('now', '-1 day')")
+
+        conn.commit()
+        print(f"[DATABASE] Aggregated {len(results)} buttons for {yesterday}")
+    except Exception as e:
+        print(f"[DATABASE] Aggregation Error: {e}")
+    finally:
+        conn.close()
+
+
+async def daily_maintenance_loop():
+    """Checks once an hour if it's midnight to run aggregation."""
+    while True:
+        now = datetime.now()
+        # Trigger at 00:01 AM
+        if now.hour == 0 and now.minute == 1:
+            # Run the sync DB function in a thread
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, run_daily_aggregation)
+            # Sleep for 70 seconds to ensure we don't trigger twice in the same minute
+            await asyncio.sleep(70)
+
+        await asyncio.sleep(60)  # Check every minute
+
+
+def log_raw_move(btn):
+    conn = sqlite3.connect('pokemon_market.db')
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO raw_moves (button) VALUES (?)", (btn,))
+    conn.commit()
+    conn.close()
+
+# Inside your async_log helper:
+async def async_log(btn):
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, log_raw_move, btn)
