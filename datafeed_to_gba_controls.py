@@ -3,32 +3,75 @@ import json
 import websockets
 import time
 import random
-import socket
+import os
+from datetime import datetime
 
 # --- Datafeed ---
 GBA_HOST = "127.0.0.1"
 GBA_PORT = 8888
-# Map your full names to the specific characters your Lua script expects
 BTN_MAP = {
     "A": "A", "B": "B", "START": "S", "SELECT": "s",
     "RIGHT": ">", "LEFT": "<", "UP": "^", "DOWN": "v",
     "L": "L", "R": "R"
 }
 
+# --- File Paths for OBS ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LAST_10_FILE = os.path.join(BASE_DIR, "current_day_moves.txt")
+TOTAL_AGG_FILE = os.path.join(BASE_DIR, "daily_total_moves.txt")
+
+# --- Tracking Variables ---
+last_10_list = []
+total_counts = {k: 0 for k in BTN_MAP.keys()}
+current_day = datetime.now().strftime('%Y-%m-%d')
+
 # Shared Queues
 trade_queue = asyncio.Queue()
 button_queue = asyncio.Queue()
 
 
+def check_day_rollover():
+    """Checks if the date has changed. If so, archives totals and resets."""
+    global current_day, total_counts, last_10_list
+
+    today = datetime.now().strftime('%Y-%m-%d')
+
+    if today != current_day:
+        # 1. Format the aggregation row for the day that just ended
+        sorted_btns = sorted(total_counts.items(), key=lambda x: x[0])
+        # Format: 2026-01-01 | A:10, B:5, UP:20...
+        counts_str = ", ".join([f"{k}:{v}" for k, v in sorted_btns if v > 0])
+        archive_row = f"{current_day} | {counts_str if counts_str else 'No moves'}\n"
+
+        # 2. Append to the aggregation file (History)
+        with open(TOTAL_AGG_FILE, "a") as f:
+            f.write(archive_row)
+
+        # 3. Reset variables for the new day
+        print(f"--- Day rolled over from {current_day} to {today}. Logs reset. ---")
+        current_day = today
+        last_10_list = []
+        total_counts = {k: 0 for k in BTN_MAP.keys()}
+
+
+def update_obs_files():
+    """Writes tracking data to text files for OBS."""
+    # Check for midnight rollover before writing
+    check_day_rollover()
+
+    # 1. Update Last 10 Moves (Vertical List) - Overwrites daily
+    with open(LAST_10_FILE, "w") as f:
+        f.write(f"RECENT MOVES ({current_day}):\n" + "\n".join(last_10_list))
+
+    # Note: total_aggregations.txt is handled by check_day_rollover (Append mode)
+    # If you also want to see a LIVE daily counter on screen,
+    # you could create a third 'today_only.txt' file here.
+
+
 async def get_coinbase_feed(symbol="BTC-USD"):
-    """Fetch live trades from Coinbase WebSocket."""
     url = "wss://ws-feed.exchange.coinbase.com"
     async with websockets.connect(url) as ws:
-        subscribe = {
-            "type": "subscribe",
-            "product_ids": [symbol],
-            "channels": ["ticker"]
-        }
+        subscribe = {"type": "subscribe", "product_ids": [symbol], "channels": ["ticker"]}
         await ws.send(json.dumps(subscribe))
         while True:
             msg = await ws.recv()
@@ -38,10 +81,8 @@ async def get_coinbase_feed(symbol="BTC-USD"):
 
 
 async def gba_logic_mapper():
-    """Analyze trade batches, log the 'Why', and queue randomized buttons."""
     batch = []
     last_batch_time = time.time()
-
     while True:
         try:
             data = await asyncio.wait_for(trade_queue.get(), timeout=0.1)
@@ -55,11 +96,9 @@ async def gba_logic_mapper():
         except Exception as e:
             print(f"Data Collection Error: {e}")
 
-        # Evaluation Window
         if time.time() - last_batch_time >= 2.0:
             if len(batch) > 0:
                 try:
-                    # --- Metrics ---
                     start_p, end_p = batch[0]["price"], batch[-1]["price"]
                     delta = ((end_p - start_p) / start_p) * 100
                     prices = [d["price"] for d in batch]
@@ -69,10 +108,7 @@ async def gba_logic_mapper():
                     max_trade = max(d["size"] for d in batch)
                     trade_count = len(batch)
 
-                    # We use a simple list of button names now
                     actions = []
-
-                    # --- Logic Engine ---
                     if buys > sells:    actions.append("RIGHT")
                     if sells > buys:   actions.append("LEFT")
                     if delta > 0:       actions.append("A")
@@ -87,54 +123,55 @@ async def gba_logic_mapper():
                     if volatility > 25: actions.append("SELECT")
 
                     if actions:
-                        # RANDOMIZE THE ORDER
                         random.shuffle(actions)
-
-                        print(f"\n[{time.strftime('%H:%M:%S')}] Commands to Execute: {actions}")
-
-                        # Feed the randomized list into the queue
+                        print(f"\n[{time.strftime('%H:%M:%S')}] Executing: {actions}")
                         for btn in actions:
                             await button_queue.put(btn)
-                    else:
-                        print(f"[{time.strftime('%H:%M:%S')}] No threshold met.")
-
                 except Exception as e:
                     print(f"Logic Calculation Error: {e}")
-            else:
-                print(f"[{time.strftime('%H:%M:%S')}] Quiet market.")
-
             batch = []
             last_batch_time = time.time()
 
 
 async def gba_sender():
-    """Pulls from button_queue and sends to mGBA with proper spacing."""
+    """Pulls from queue, updates logs, and sends to mGBA."""
+    global last_10_list
     while True:
         btn_name = await button_queue.get()
         char = BTN_MAP.get(btn_name)
 
         if char:
+            # --- Update Stats ---
+            total_counts[btn_name] += 1
+            last_10_list.append(btn_name)
+            if len(last_10_list) > 10:
+                last_10_list.pop(0)
+
+            # --- Write to Files ---
+            update_obs_files()
+
+            # --- Send to mGBA ---
             try:
-                # Open/Close connection per burst or keep persistent
-                # Persistence is better for performance:
                 reader, writer = await asyncio.open_connection(GBA_HOST, GBA_PORT)
                 writer.write(f"{char}\n".encode())
                 await writer.drain()
                 writer.close()
                 await writer.wait_closed()
-
-                # Wait 0.2s: This gives the GBA 12 frames to process the
-                # 6-frame press/release cycle we wrote in Lua.
                 await asyncio.sleep(0.2)
             except Exception as e:
                 print(f"Connection to mGBA failed: {e}")
-                await asyncio.sleep(2)  # Wait before retrying
+                await asyncio.sleep(2)
 
         button_queue.task_done()
 
 
 async def main():
-    print(f"Initializing Pokémon Market Controller on port {GBA_PORT}...")
+    # Initialize the Aggregation file with a header if it doesn't exist
+    if not os.path.exists(TOTAL_AGG_FILE):
+        with open(TOTAL_AGG_FILE, "w") as f:
+            f.write("DATE | BUTTON PRESS TOTALS\n" + "=" * 30 + "\n")
+
+    print(f"Initializing Pokémon Market Controller...")
     await asyncio.gather(
         get_coinbase_feed("BTC-USD"),
         gba_logic_mapper(),
@@ -147,97 +184,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nSystem Offline.")
-
-# --- Store Results ---
-
-import sqlite3
-from datetime import datetime, timedelta
-
-
-def init_db():
-    conn = sqlite3.connect('pokemon_market.db')
-    cursor = conn.cursor()
-
-    # Table 1: Raw logs (every single press)
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS raw_moves (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            button TEXT
-        )
-    ''')
-
-    # Table 2: Daily Totals
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS daily_aggregates (
-            date TEXT PRIMARY KEY,
-            button TEXT,
-            press_count INTEGER
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-
-def run_daily_aggregation():
-    """Aggregates yesterday's moves and clears the raw log."""
-    conn = sqlite3.connect('pokemon_market.db')
-    cursor = conn.cursor()
-
-    yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-
-    try:
-        # 1. Get counts for each button
-        cursor.execute('''
-            SELECT button, COUNT(*) 
-            FROM raw_moves 
-            WHERE date(timestamp) = ?
-            GROUP BY button
-        ''', (yesterday,))
-
-        results = cursor.fetchall()
-
-        # 2. Insert into the aggregate table
-        for button, count in results:
-            cursor.execute('''
-                INSERT OR REPLACE INTO daily_aggregates (date, button, press_count)
-                VALUES (?, ?, ?)
-            ''', (yesterday, button, count))
-
-        # 3. Clean up: Delete raw logs older than 24 hours
-        cursor.execute("DELETE FROM raw_moves WHERE timestamp < datetime('now', '-1 day')")
-
-        conn.commit()
-        print(f"[DATABASE] Aggregated {len(results)} buttons for {yesterday}")
-    except Exception as e:
-        print(f"[DATABASE] Aggregation Error: {e}")
-    finally:
-        conn.close()
-
-
-async def daily_maintenance_loop():
-    """Checks once an hour if it's midnight to run aggregation."""
-    while True:
-        now = datetime.now()
-        # Trigger at 00:01 AM
-        if now.hour == 0 and now.minute == 1:
-            # Run the sync DB function in a thread
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, run_daily_aggregation)
-            # Sleep for 70 seconds to ensure we don't trigger twice in the same minute
-            await asyncio.sleep(70)
-
-        await asyncio.sleep(60)  # Check every minute
-
-
-def log_raw_move(btn):
-    conn = sqlite3.connect('pokemon_market.db')
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO raw_moves (button) VALUES (?)", (btn,))
-    conn.commit()
-    conn.close()
-
-# Inside your async_log helper:
-async def async_log(btn):
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, log_raw_move, btn)
