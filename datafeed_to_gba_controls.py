@@ -109,14 +109,14 @@ async def gba_logic_mapper():
                     trade_count = len(batch)
 
                     actions = []
-                    if buys > sells:    actions.append("RIGHT")
-                    if sells > buys:   actions.append("LEFT")
-                    if delta > 0:       actions.append("A")
-                    if delta <= 0:      actions.append("B")
-                    if trade_count > 5:
-                        actions.append("UP")
+                    if buys > sells:    actions.append("UP")
+                    if sells > buys:   actions.append("DOWN")
+                    if abs(delta) > 0.05:       actions.append("B")
+                    if abs(delta) <= 0.05:      actions.append("A")
+                    if trade_count >= 3:
+                        actions.append("LEFT")
                     else:
-                        actions.append("DOWN")
+                        actions.append("RIGHT")
                     if delta > 0.05:    actions.append("L")
                     if delta < -0.05:   actions.append("R")
                     if max_trade > 0.1: actions.append("START")
