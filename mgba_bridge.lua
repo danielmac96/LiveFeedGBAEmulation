@@ -59,6 +59,12 @@ function ST_received(id)
         -- FIX: Only process if 'p' is NOT nil
         if p ~= nil then
             local cmd = p:match("^(.-)%s*$")
+            if cmd == "SAVE" then
+                -- This tells mGBA to create a save state in Slot 1
+                emu:saveState(1)
+                console:log("SYSTEM: Hourly Save State Created in Slot 1")
+                return -- Skip the normal button press logic for this command
+            end
 
             -- Extra safety: Check if match found anything
             if cmd then
@@ -69,7 +75,12 @@ function ST_received(id)
                     emu:addKey(btn_id)
                     console:log("PRESSED: " .. cmd)
                     btnToRelease = btn_id
-                    releaseFrames = 6
+--                     releaseFrames = 6
+                    if cmd == "^" or cmd == "v" or cmd == "<" or cmd == ">" then
+                        releaseFrames = 14 -- Increased to 15 to ensure a full step
+                    else
+                        releaseFrames = 3  -- Keep menus/buttons snappy
+                    end
                 end
             end
         else

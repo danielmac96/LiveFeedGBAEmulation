@@ -109,13 +109,19 @@ async def gba_logic_mapper():
                     trade_count = len(batch)
 
                     actions = []
-                    if buys > sells:    actions.append("UP")
-                    if sells > buys:   actions.append("DOWN")
-                    if abs(delta) > 0.05:       actions.append("B")
-                    if abs(delta) <= 0.05:      actions.append("A")
-                    if trade_count >= 3:
+                    if buys > sells:
+                        actions.append("UP")
+                        actions.append("UP")
+                    if sells > buys:
+                        actions.append("DOWN")
+                        actions.append("DOWN")
+                    if abs(delta) > 0.00005:       actions.append("B")
+                    if abs(delta) <= 0.00005:      actions.append("A")
+                    if trade_count >= 10:
+                        actions.append("LEFT")
                         actions.append("LEFT")
                     else:
+                        actions.append("RIGHT")
                         actions.append("RIGHT")
                     if delta > 0.05:    actions.append("L")
                     if delta < -0.05:   actions.append("R")
@@ -132,6 +138,28 @@ async def gba_logic_mapper():
             batch = []
             last_batch_time = time.time()
 
+
+SAVE_INTERVAL = 3600  # 3600 seconds = 1 hour
+last_save_time = time.time()
+
+
+async def hourly_save_tracker():
+    """Background task that triggers a save every hour."""
+    global last_save_time
+    while True:
+        current_time = time.time()
+
+        # Check if an hour has passed
+        if current_time - last_save_time >= SAVE_INTERVAL:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Triggering Hourly Save...")
+
+            # Put the special 'SAVE' command at the front of the queue
+            await button_queue.put("SAVE")
+
+            last_save_time = current_time
+
+        # Sleep for a minute before checking the clock again
+        await asyncio.sleep(60)
 
 async def gba_sender():
     """Pulls from queue, updates logs, and sends to mGBA."""
@@ -175,7 +203,8 @@ async def main():
     await asyncio.gather(
         get_coinbase_feed("BTC-USD"),
         gba_logic_mapper(),
-        gba_sender()
+        gba_sender(),
+        hourly_save_tracker()
     )
 
 
